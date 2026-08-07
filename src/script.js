@@ -24,6 +24,135 @@ function resolveAssetUrl(value) {
   return value;
 }
 
+const ENCRYPTION_MAGIC = "HTMdLENC";
+const ENCRYPTION_VERSION = 1;
+const KDF_ITERATIONS = 200000;
+const SALT_LENGTH = 16;
+const NONCE_LENGTH = 12;
+
+function parseHashParameters(hash = window.location.hash) {
+  const raw = String(hash || "").replace(/^#/, "");
+  if (!raw) return {};
+
+  return raw.split("&").reduce((params, segment) => {
+    const [key, ...rest] = segment.split("=");
+    if (!key) return params;
+    params[key.toLowerCase()] = rest.length ? decodeURIComponent(rest.join("=")) : "";
+    return params;
+  }, {});
+}
+
+function getPasswordFromHash() {
+  const params = parseHashParameters();
+  return params.pwd || params.password || "";
+}
+
+function getAnchorFromHash() {
+  const params = parseHashParameters();
+  if (params.anchor) return params.anchor;
+
+  const raw = String(window.location.hash || "").replace(/^#/, "");
+  if (!raw || raw.includes("=")) return "";
+  return raw;
+}
+
+function buildHashFragment(anchor = "") {
+  const password = getPasswordFromHash();
+  const segments = [];
+  if (password) {
+    segments.push(`pwd=${encodeURIComponent(password)}`);
+  }
+  if (anchor) {
+    segments.push(`anchor=${encodeURIComponent(anchor)}`);
+  }
+  return segments.length ? `#${segments.join("&")}` : "";
+}
+
+function buildChapterLink(target, anchor = "") {
+  return `?chapter=${target}${buildHashFragment(anchor)}`;
+}
+
+async function getAesKey(password, salt) {
+  const passwordBytes = new TextEncoder().encode(password);
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    passwordBytes,
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt,
+      iterations: KDF_ITERATIONS,
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+}
+
+async function decryptMdData(arrayBuffer, password) {
+  const data = new Uint8Array(arrayBuffer);
+  const header = new TextDecoder().decode(data.subarray(0, ENCRYPTION_MAGIC.length));
+  if (header !== ENCRYPTION_MAGIC) {
+    throw new Error("Unrecognized encrypted file format.");
+  }
+
+  const version = data[ENCRYPTION_MAGIC.length];
+  if (version !== ENCRYPTION_VERSION) {
+    throw new Error("Unsupported encrypted file version.");
+  }
+
+  const saltStart = ENCRYPTION_MAGIC.length + 1;
+  const salt = data.subarray(saltStart, saltStart + SALT_LENGTH);
+  const nonceStart = saltStart + SALT_LENGTH;
+  const nonce = data.subarray(nonceStart, nonceStart + NONCE_LENGTH);
+  const ciphertext = data.subarray(nonceStart + NONCE_LENGTH);
+
+  const key = await getAesKey(password, salt);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: nonce },
+    key,
+    ciphertext
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
+async function fetchEncryptedFile(url, password) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Encrypted file not found: ${url}`);
+  }
+  const data = await response.arrayBuffer();
+  return await decryptMdData(data, password);
+}
+
+async function fetchChapterContent(chapterPath) {
+  const password = getPasswordFromHash();
+  if (password) {
+    try {
+      return await fetchEncryptedFile(`${chapterPath}.enc`, password);
+    } catch (error) {
+      console.warn("Encrypted chapter fetch failed:", error);
+    }
+  }
+
+  const response = await fetch(chapterPath);
+  if (!response.ok) {
+    throw new Error(`Could not load chapter ${chapterPath}`);
+  }
+  return await response.text();
+}
+
+function getFragmentAnchor() {
+  const anchor = getAnchorFromHash();
+  return anchor ? `#${anchor}` : (window.location.hash && !window.location.hash.includes("=") ? window.location.hash : "");
+}
+
 function setPageTheme(bgColor, textColor) {
   pageTheme = { bgColor, textColor };
   document.body.style.background = bgColor;
@@ -112,7 +241,7 @@ function parseInline(text, sourceRefsForChapter = []) {
       const sourceEntry = sourceRefsForChapter[sourceCursor];
       sourceCursor += 1;
       const sourceLink = sourceEntry
-        ? `<a id="source-${sourceEntry.number}" class="source-ref" href="?chapter=sources#source-${sourceEntry.number}">[${sourceEntry.number}]</a>`
+        ? `<a id="source-${sourceEntry.number}" class="source-ref" href="${buildChapterLink("sources", `source-${sourceEntry.number}`)}">[${sourceEntry.number}]</a>`
         : "[source]";
       fragments.push(sourceLink);
     } else if (imageAlt !== undefined) {
@@ -323,7 +452,7 @@ function scrollToHash(hash) {
 
 function renderSources() {
   const sourceItems = sources.map((source) => {
-    return `<li id="source-${source.number}"><a href="?chapter=${source.chapterIndex}#source-${source.number}">[${source.number}]</a>: <a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(source.url)}</a></li>`;
+    return `<li id="source-${source.number}"><a href="${buildChapterLink(source.chapterIndex, `source-${source.number}`)}">[${source.number}]</a>: <a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(source.url)}</a></li>`;
   });
 
   app.innerHTML = `
@@ -346,7 +475,7 @@ function renderSources() {
     navigateTo(event.target.value);
   });
 
-  scrollToHash(window.location.hash);
+  scrollToHash(getFragmentAnchor());
 }
 
 function renderChapter(index) {
@@ -387,7 +516,7 @@ function renderChapter(index) {
     }
   });
 
-  scrollToHash(window.location.hash);
+  scrollToHash(getFragmentAnchor());
 }
 
 function navigateTo(target) {
@@ -395,8 +524,8 @@ function navigateTo(target) {
     currentChapterIndex = "sources";
     const nextUrl = new URL(window.location.href);
     nextUrl.searchParams.set("chapter", "sources");
-    nextUrl.hash = "";
-    history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}`);
+    nextUrl.hash = buildHashFragment();
+    history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
     renderSources();
     return;
   }
@@ -413,8 +542,8 @@ function navigateTo(target) {
   currentChapterIndex = chapterIndex;
   const nextUrl = new URL(window.location.href);
   nextUrl.searchParams.set("chapter", String(chapterIndex));
-  nextUrl.hash = "";
-  history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}`);
+  nextUrl.hash = buildHashFragment();
+  history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
   renderChapter(chapterIndex);
 }
 
@@ -437,7 +566,7 @@ function initFromQuery() {
 
   const fallbackIndex = unlockedChapters[unlockedChapters.length - 1] ?? 0;
   currentChapterIndex = fallbackIndex;
-  history.replaceState({}, "", `?chapter=${fallbackIndex}`);
+  history.replaceState({}, "", `?chapter=${fallbackIndex}${buildHashFragment()}`);
   renderChapter(fallbackIndex);
 }
 
@@ -459,17 +588,16 @@ async function loadChapters() {
     for (const [index, entry] of metadata.chapters.entries()) {
       const chapterPath = entry.file;
       let response;
+      let markdown;
       try {
-        response = await fetch(`./mdsrc/${chapterPath}`);
-      } catch {
-        response = await fetch(`./mdsrc/${chapterPath.replace("chap03", "chap-3")}`);
+        markdown = await fetchChapterContent(`./mdsrc/${chapterPath}`);
+      } catch (error) {
+        if (chapterPath.includes("chap03")) {
+          markdown = await fetchChapterContent(`./mdsrc/${chapterPath.replace("chap03", "chap-3")}`);
+        } else {
+          throw error;
+        }
       }
-
-      if (!response.ok) {
-        throw new Error(`Could not load chapter ${chapterPath}`);
-      }
-
-      const markdown = await response.text();
       const title = getChapterTitle(markdown, index);
       chapters.push({
         title,

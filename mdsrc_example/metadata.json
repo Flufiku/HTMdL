@@ -1,0 +1,23 @@
+{
+  "chapters": [
+    {
+      "file": "chapter_01.md",
+      "bg_color": "#ead2a8",
+      "text_color": "#000000"
+    },
+    {
+      "file": "chapter2.md",
+      "bg_color": "#ead2a8",
+      "text_color": "#000000"
+    },
+    {
+      "file": "chap-3.md",
+      "bg_color": "#ead2a8",
+      "text_color": "#000000"
+    }
+  ],
+  "sources": {
+    "bg_color": "#ead2a8",
+    "text_color": "#000000"
+  }
+}
